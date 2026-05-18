@@ -1,0 +1,18 @@
+# 방송 DB 처리 시스템 — 필요 패키지 (Windows 전용)
+# pip install -r requirements.txt
+
+pyodbc>=4.0.39          # SQL Server 2008 R2 ODBC 연결 (Windows ODBC 드라이버 직접 사용)
+xlsxwriter>=3.1.0       # Excel xlsx 쓰기 전용 — openpyxl 대비 메모리 효율·포맷 API 우수
+requests>=2.31.0        # Google Drive Config_DB.db 다운로드
+PySide6>=6.6.0          # GUI 프레임워크
+
+# ── 설치 메모 ──────────────────────────────────────────────────────────
+# [pyodbc] Windows ODBC 드라이버 필요 (아래 중 하나):
+#   - "SQL Server"                     Windows 기본 제공, SQL Server 2008 R2 지원
+#   - "ODBC Driver 17 for SQL Server"  Microsoft 별도 설치 (권장)
+#   Config_DB.db 의 DB_Type 컬럼 값과 드라이버 이름이 정확히 일치해야 합니다.
+#
+# [xlsxwriter] 쓰기 전용 라이브러리 — 기존 xlsx 파일 읽기/수정 불가
+#   이 프로그램은 Excel 파일을 새로 생성만 하므로 문제 없음
+#
+# [sqlite3] Python 표준 라이브러리 — 별도 설치 불필요
