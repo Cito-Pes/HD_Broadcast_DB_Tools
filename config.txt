@@ -6,4 +6,4 @@ Not_Charge_IDP = '20239894', '20239893', '6655','5555', '0500', '1338', '8526', 
 Not_PlaceofDuty = '글로벌세무금융','조아유','문화상사','올리고생활건강'
 
 
-
+google_doc_key = 1oncya1uYDnbVS2KwuBAKw4x4o9oQDct0
