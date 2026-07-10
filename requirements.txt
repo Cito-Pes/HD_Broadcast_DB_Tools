@@ -5,6 +5,7 @@ pyodbc>=4.0.39          # SQL Server 2008 R2 ODBC 연결 (Windows ODBC 드라이
 xlsxwriter>=3.1.0       # Excel xlsx 쓰기 전용 — openpyxl 대비 메모리 효율·포맷 API 우수
 requests>=2.31.0        # Google Drive Config_DB.db 다운로드
 PySide6>=6.6.0          # GUI 프레임워크
+lxml>=5.0.0
 
 # ── 설치 메모 ──────────────────────────────────────────────────────────
 # [pyodbc] Windows ODBC 드라이버 필요 (아래 중 하나):

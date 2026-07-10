@@ -11,7 +11,7 @@ def build_program():
     print("▶ Windows 배포용 실행 파일(.exe) 빌드를 시작합니다...")
     
     # 주요 타깃 파일 정의
-    script_path = "broadcast_db_tool.py"
+    script_path = "tax_invoice_viewer.py"
     icon_path = os.path.join("img", "ht.ico")
     
     if not os.path.exists(script_path):
@@ -28,7 +28,7 @@ def build_program():
         "--onefile",
         f"--icon={icon_path}" if os.path.exists(icon_path) else "",
         "--add-data=img;img",  # 내부 자산 폴더 매핑 (Windows 구조)
-        "--name=방송_DB_처리_시스템_v1.2",
+        "--name=세금계산서 출력 뷰어_v1",
         script_path
     ]
     
@@ -40,7 +40,7 @@ def build_program():
         subprocess.check_call(cmd)
         print("\n" + "="*60)
         print("🎉 [성공] PyInstaller 빌드가 완료되었습니다!")
-        print("👉 결과물 위치: ./dist/방송_DB_처리_시스템_v1.2.exe")
+        print("👉 결과물 위치: ./dist/세금계산서_출력_뷰어_v1.exe")
         print("="*60 + "\n")
     except subprocess.CalledProcessError as e:
         print(f"\n[오류] 빌드 중 에러가 발생했습니다: {e}")

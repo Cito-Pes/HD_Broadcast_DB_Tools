@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # 방송 DB 처리 시스템 (레이아웃 비율 및 가독성 버그 수정 버전)
 # 기능1: 전화번호 기반 중복 정보 추출 + 엑셀 저장 (단일 시트/테이블 통합)
 # 기능2: 상담내역 등록 (추후 구현)
@@ -11,17 +11,10 @@
 import os
 import re
 import sys
+import sqlite3
+import requests
+import pyodbc
 import xlsxwriter
-from DB_conn import (
-    DB_DIR,
-    DB_FILE,
-    CONFIG_TXT,
-    download_db,
-    get_mssql_connection,
-    load_config_txt,
-    load_db_config,
-)
-from employee_login import LoginDialog, LoginUser
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QThread, Signal
@@ -51,10 +44,35 @@ def resource_path(relative_path):
 # =============================================================================
 # ★ 수정 필요: Google Drive 공유 링크 및 Config 식별자
 # =============================================================================
-# Shared DB connection settings are imported from DB_conn.py.
-# =============================================================================
 
-CURRENT_USER: LoginUser | None = None
+DB_DIR     = "./DB"
+DB_FILE    = "Config_DB.db"
+CONFIG_NAME = "HD_MSSQL"   # DBCON 테이블의 Name 값
+CONFIG_TXT  = "./config.txt"
+
+def load_config_txt(filepath: str = CONFIG_TXT) -> dict[str, str, str]:
+    config: dict[str, str, str] = {'Not_Charge_IDP': '', 'Not_PlaceofDuty': '', 'google_doc_key':''}
+    if not os.path.exists(filepath):
+        return config
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' in line:
+                    key, _, value = line.partition('=')
+                    key = key.strip()
+                    value = value.strip()
+                    if key in config:
+                        config[key] = value
+    except Exception as e:
+        print(f"[WARN] config.txt 읽기 실패: {e}")
+    return config
+
+config_txt = load_config_txt(CONFIG_TXT)
+DOC_Key = config_txt.get('google_doc_key', '').strip()
+GDRIVE_URL = f"https://drive.google.com/file/d/{DOC_Key}/view?usp=drive_link"
 
 # =============================================================================
 # SQL 쿼리 정의 (기존 유지)
@@ -63,32 +81,6 @@ QUERY_CHANNEL_COMBO = (
     "SELECT Code_Name FROM Code "
     "WHERE code = '채널경로' ORDER BY Num;"
 )
-
-# ─── 상담구분 콤보박스 ────────────────────────────────────────────────────
-# ★ 수정 필요: Code 테이블의 실제 상담구분 code 값을 확인 후 변경
-QUERY_CONSULT_TYPE_COMBO = (
-    "select Code_Name from code where code = '상담구분' order by num; "
-)
-
-# ─── 상담내역 INSERT ────────────────────────────────────────────────────────
-# 파라미터 순서: (사번, 회원코드, 상담내용, 상담구분)
-QUERY_INSERT_MEMO = """\
-INSERT INTO TM_M_Memo
-    (Note_Date, Note_time, Charge_ID, ID, TMemo,
-     Save_Date, Modi_Date,
-     TelCall_Gu, TelCall_ErrGu, TelCall_Mem,
-     Memo_GuBun, ProDate, M_Submit, M_PayNum, ProTime)
-VALUES
-    (SUBSTRING(CONVERT(VARCHAR(30), GETDATE(), 120), 1, 10),
-     SUBSTRING(CONVERT(VARCHAR(30), GETDATE(), 120), 11, 20),
-     ?,
-     ?,
-     ?,
-     CONVERT(VARCHAR(30), GETDATE(), 120),
-     CONVERT(VARCHAR(30), GETDATE(), 120),
-     ?,
-     '', '', '2', '', 'OTHER', 0, '')
-"""
 
 QUERY_ALL_DUP = """\
 SELECT x.mobile, COUNT(*) AS all_cnt
@@ -259,6 +251,8 @@ def parse_phones(text: str) -> list[str]:
 def build_in_clause(items: list[str]) -> str:
     return ', '.join(f"'{item}'" for item in items)
 
+
+
 def safe_str(val) -> str:
     if val is None:
         return ''
@@ -266,25 +260,55 @@ def safe_str(val) -> str:
         return val.strftime('%Y-%m-%d')
     return str(val)
 
-def parse_member_codes(text: str) -> list[str]:
-    """
-    여러 줄 입력에서 회원코드 목록 추출
-    - 줄바꿈 기준 분리, 앞뒤 공백 제거
-    - 빈 값·중복 제거, 입력 순서 유지
-    """
-    seen:  set[str]  = set()
-    codes: list[str] = []
-    for line in text.splitlines():
-        code = line.strip()
-        if code and code not in seen:
-            codes.append(code)
-            seen.add(code)
-    return codes
-
 # =============================================================================
 # DB 접속 및 다운로드 관련
 # =============================================================================
-# DB connection helpers are provided by DB_conn.py.
+def download_db() -> tuple[bool, str]:
+    db_path = os.path.join(DB_DIR, DB_FILE)
+    if not os.path.exists(DB_DIR):
+        os.makedirs(DB_DIR)
+    try:
+        match = re.search(r"/d/([a-zA-Z0-9_-]+)", GDRIVE_URL)
+        if not match:
+            raise ValueError("Google Drive 파일 ID를 추출할 수 없습니다.")
+        file_id = match.group(1)
+        download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        session = requests.Session()
+        resp = session.get(download_url, stream=True)
+        resp.raise_for_status()
+        if "text/html" in resp.headers.get("Content-Type", ""):
+            for key, value in resp.cookies.items():
+                if key.startswith("download_warning"):
+                    download_url = f"https://drive.google.com/uc?export=download&confirm={value}&id={file_id}"
+                    resp = session.get(download_url, stream=True)
+                    resp.raise_for_status()
+                    break
+        with open(db_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        return True, db_path
+    except Exception as e:
+        return False, str(e)
+
+def load_db_config() -> dict:
+    db_path = os.path.join(DB_DIR, DB_FILE)
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT DB_Type, Host, Port, DB_Name, DB_ID, DB_PW FROM DBCON WHERE Name = ?", (CONFIG_NAME,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            raise LookupError(f"DBCON 테이블에 Name='{CONFIG_NAME}' 레코드가 없습니다.")
+        return {"DB_Type": row[0], "Host": row[1], "Port": row[2], "DB_Name": row[3], "DB_ID": row[4], "DB_PW": row[5]}
+    except Exception as e:
+        raise Exception(f"DB 설정 로드 실패: {e}")
+
+def get_mssql_connection(cfg: dict) -> pyodbc.Connection:
+    conn_str = f"DRIVER={{{cfg['DB_Type']}}};SERVER={cfg['Host']},{cfg['Port']};DATABASE={cfg['DB_Name']};UID={cfg['DB_ID']};PWD={cfg['DB_PW']}"
+    return pyodbc.connect(conn_str, timeout=30)
+
 # =============================================================================
 # Worker Threads
 # =============================================================================
@@ -301,27 +325,6 @@ class ChannelLoadWorker(QThread):
             conn = get_mssql_connection(self.db_config)
             cursor = conn.cursor()
             cursor.execute(QUERY_CHANNEL_COMBO)
-            rows = cursor.fetchall()
-            conn.close()
-            self.finished.emit([row[0] for row in rows])
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class ConsultTypeWorker(QThread):
-    """상담구분 콤보박스 데이터 로드"""
-    finished = Signal(list)
-    error    = Signal(str)
-
-    def __init__(self, db_config: dict):
-        super().__init__()
-        self.db_config = db_config
-
-    def run(self):
-        try:
-            conn = get_mssql_connection(self.db_config)
-            cursor = conn.cursor()
-            cursor.execute(QUERY_CONSULT_TYPE_COMBO)
             rows = cursor.fetchall()
             conn.close()
             self.finished.emit([row[0] for row in rows])
@@ -381,69 +384,6 @@ class QueryWorker(QThread):
 
             self.progress.emit("조회 완료!")
             self.finished.emit(results)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class MemoInsertWorker(QThread):
-    """
-    상담내역 일괄 INSERT 워커
-    회원코드 목록을 순서대로 처리하며 건별 로그를 emit
-    """
-    log_msg  = Signal(str)       # 건별 처리 메시지
-    finished = Signal(int, int)  # (성공 건수, 실패 건수)
-    error    = Signal(str)       # 연결 오류 등 치명적 오류
-
-    def __init__(
-        self,
-        db_config:    dict,
-        member_codes: list[str],
-        memo_content: str,
-        consult_type: str,
-        sabun:        str,
-    ):
-        super().__init__()
-        self.db_config    = db_config
-        self.member_codes = member_codes
-        self.memo_content = memo_content
-        self.consult_type = consult_type
-        self.sabun        = sabun
-
-    def run(self):
-        try:
-            conn   = get_mssql_connection(self.db_config)
-            cursor = conn.cursor()
-
-            total   = len(self.member_codes)
-            success = 0
-            fail    = 0
-
-            self.log_msg.emit(
-                f"[시작] 총 {total}건 처리 시작 "
-                f"({datetime.now().strftime('%H:%M:%S')})"
-            )
-
-            for idx, code in enumerate(self.member_codes, 1):
-                self.log_msg.emit(f"[{idx}/{total}] {code} 처리 중...")
-                try:
-                    cursor.execute(
-                        QUERY_INSERT_MEMO,
-                        (self.sabun, code, self.memo_content, self.consult_type)
-                    )
-                    conn.commit()
-                    success += 1
-                    self.log_msg.emit(f"  ✓ {code} — 등록 완료")
-                except Exception as row_err:
-                    fail += 1
-                    self.log_msg.emit(f"  ✗ {code} — 오류: {row_err}")
-
-            conn.close()
-            self.log_msg.emit(
-                f"\n[완료] 성공: {success}건  실패: {fail}건 "
-                f"({datetime.now().strftime('%H:%M:%S')})"
-            )
-            self.finished.emit(success, fail)
-
         except Exception as e:
             self.error.emit(str(e))
 
@@ -547,25 +487,20 @@ def export_to_excel(results: dict, filepath: str, channel_name: str) -> None:
 # =============================================================================
 class MainWindow(QMainWindow):
 
-    def __init__(self, db_config: dict):
+    def __init__(self):
         super().__init__()
-        self.db_config:       dict                    = db_config
-        self.query_results:   dict | None             = None
-        self.worker:          QueryWorker | None      = None
-        self.ch_worker:       ChannelLoadWorker | None = None
-        self.ct_worker:       ConsultTypeWorker | None = None
-        self.memo_worker:     MemoInsertWorker | None  = None
-        self.config_txt:      dict                    = {}
+        self.db_config:     dict | None  = None
+        self.query_results: dict | None  = None
+        self.worker:        QueryWorker | None       = None
+        self.ch_worker:     ChannelLoadWorker | None = None
+        self.config_txt:    dict = {}
 
-        # 타이틀 끝에 [사원명] 표시
-        self.setWindowTitle(
-            f"방송 DB 처리 시스템 v1.2 [{CURRENT_USER.saname if CURRENT_USER else ''}]"
-        )
+        self.setWindowTitle("방송 DB 처리 시스템 v1.1")
         self.setMinimumSize(1150, 760)
 
         self._build_ui()
         self._apply_styles()
-        self._post_login_init()
+        self.load_config()
 
     def _build_ui(self):
         central = QWidget()
@@ -718,129 +653,17 @@ class MainWindow(QMainWindow):
         return w
 
     def _build_tab_consultation(self) -> QWidget:
-        """상담내역 등록 탭 — 좌: 회원코드 입력 / 우: 설정+내용+처리현황"""
         w = QWidget()
-        root = QVBoxLayout(w)
-        root.setContentsMargins(10, 8, 10, 8)
-        root.setSpacing(6)
-
-        # ── 메인 스플리터 ──────────────────────────────────────────────
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-
-        # ── 좌측: 회원코드 입력 ────────────────────────────────────────
-        left = QWidget()
-        left.setMinimumWidth(200)
-        left.setMaximumWidth(280)
-        l_lay = QVBoxLayout(left)
-        l_lay.setContentsMargins(0, 4, 6, 0)
-        l_lay.setSpacing(4)
-
-        grp_codes = QGroupBox("회원코드 입력")
-        gc_lay = QVBoxLayout(grp_codes)
-        gc_lay.setSpacing(4)
-
-        lbl_hint = QLabel("한 줄에 하나씩 입력 (중복 자동 제거)")
-        lbl_hint.setStyleSheet("color:#666; font-size:10px;")
-        gc_lay.addWidget(lbl_hint)
-
-        self.txt_memo_codes = QPlainTextEdit()
-        self.txt_memo_codes.setPlaceholderText(
-            "예시:\nM00012345\nM00067890"
-        )
-        self.txt_memo_codes.setFont(QFont("Consolas", 10))
-        self.txt_memo_codes.textChanged.connect(self._update_memo_code_count)
-        gc_lay.addWidget(self.txt_memo_codes)
-
-        self.lbl_memo_code_count = QLabel("0개 입력됨")
-        self.lbl_memo_code_count.setStyleSheet("color:#555; font-size:10px;")
-        gc_lay.addWidget(self.lbl_memo_code_count)
-
-        btn_code_clear = QPushButton("지우기")
-        btn_code_clear.setObjectName("btnSecondary")
-        btn_code_clear.setMaximumWidth(70)
-        btn_code_clear.clicked.connect(self.txt_memo_codes.clear)
-        gc_lay.addWidget(btn_code_clear)
-
-        l_lay.addWidget(grp_codes)
-        splitter.addWidget(left)
-
-        # ── 우측: 설정 + 내용 + 처리현황 ──────────────────────────────
-        right = QWidget()
-        r_lay = QVBoxLayout(right)
-        r_lay.setContentsMargins(0, 4, 0, 0)
-        r_lay.setSpacing(6)
-
-        # 상담구분 콤보박스
-        grp_setting = QGroupBox("상담 설정")
-        grp_setting.setMaximumHeight(70)
-        gs_lay = QHBoxLayout(grp_setting)
-        gs_lay.setContentsMargins(12, 4, 12, 8)
-        gs_lay.setSpacing(8)
-
-        gs_lay.addWidget(QLabel("상담구분 :"))
-        self.cmb_consult_type = QComboBox()
-        self.cmb_consult_type.setMinimumWidth(180)
-        gs_lay.addWidget(self.cmb_consult_type)
-
-        self.btn_refresh_ct = QPushButton("🔄")
-        self.btn_refresh_ct.setFixedSize(32, 28)
-        self.btn_refresh_ct.setToolTip("상담구분 목록 새로고침")
-        self.btn_refresh_ct.clicked.connect(self.load_consult_types)
-        gs_lay.addWidget(self.btn_refresh_ct)
-        gs_lay.addStretch()
-
-        r_lay.addWidget(grp_setting)
-
-        # 상담내용 입력
-        grp_content = QGroupBox("상담내용")
-        gcnt_lay = QVBoxLayout(grp_content)
-        gcnt_lay.setContentsMargins(8, 8, 8, 8)
-
-        self.txt_memo_content = QPlainTextEdit()
-        self.txt_memo_content.setPlaceholderText("상담 내용을 입력하세요...")
-        self.txt_memo_content.setMaximumHeight(120)
-        self.txt_memo_content.setFont(QFont("맑은 고딕", 10))
-        gcnt_lay.addWidget(self.txt_memo_content)
-
-        r_lay.addWidget(grp_content)
-
-        # 등록 버튼
-        self.btn_memo_submit = QPushButton("✅  상담내역 등록 실행")
-        self.btn_memo_submit.setMinimumHeight(36)
-        self.btn_memo_submit.setStyleSheet(
-            "QPushButton { background-color:#1A6B2F; border-color:#145520; font-size:13px; }"
-            "QPushButton:hover { background-color:#22883C; }"
-            "QPushButton:pressed { background-color:#104018; }"
-            "QPushButton:disabled { background-color:#D3D3D3; color:#777777; border-color:#CCCCCC; }"
-        )
-        self.btn_memo_submit.clicked.connect(self._run_memo_insert)
-        r_lay.addWidget(self.btn_memo_submit)
-
-        # 처리 현황 로그
-        grp_log = QGroupBox("처리 현황")
-        gl_lay = QVBoxLayout(grp_log)
-        gl_lay.setContentsMargins(8, 8, 8, 8)
-        gl_lay.setSpacing(4)
-
-        self.txt_memo_log = QPlainTextEdit()
-        self.txt_memo_log.setReadOnly(True)
-        self.txt_memo_log.setFont(QFont("Consolas", 10))
-        self.txt_memo_log.setPlaceholderText("처리 결과가 여기에 표시됩니다.")
-        gl_lay.addWidget(self.txt_memo_log)
-
-        btn_log_clear = QPushButton("로그 지우기")
-        btn_log_clear.setObjectName("btnSecondary")
-        btn_log_clear.setMaximumWidth(90)
-        btn_log_clear.clicked.connect(self.txt_memo_log.clear)
-        gl_lay.addWidget(btn_log_clear)
-
-        r_lay.addWidget(grp_log)
-
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-
-        root.addWidget(splitter)
+        lay = QVBoxLayout(w)
+        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl1 = QLabel("📝  상담내역 등록")
+        lbl1.setStyleSheet("font-size:26px; color:#8899AA;")
+        lbl1.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(lbl1)
+        lbl2 = QLabel("이 기능은 추후 구현 예정입니다.")
+        lbl2.setStyleSheet("font-size:13px; color:#AABBC0;")
+        lbl2.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(lbl2)
         return w
 
     def _apply_styles(self):
@@ -945,29 +768,35 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(msg)
         print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-    def _post_login_init(self):
-        """로그인 완료 후 초기화 (config.txt 로드 + 채널/상담구분 로드)"""
+    def load_config(self):
+        self.log("설정 파일 확인 중...")
         self.config_txt = load_config_txt(CONFIG_TXT)
         exc_idp = self.config_txt.get('Not_Charge_IDP', '').strip()
         exc_org = self.config_txt.get('Not_PlaceofDuty', '').strip()
+        DOC_Key = self.config_txt.get('google_doc_key', '').strip()
 
         if exc_idp or exc_org:
-            preview = (
-                f"제외상담사 설정 {len(exc_idp.split(','))}개 | "
-                f"제외조직 설정 {len(exc_org.split(','))}개"
-            )
+            preview = f"제외상담사 설정 {len(exc_idp.split(','))}개 | 제외조직 설정 {len(exc_org.split(','))}개"
             self.lbl_config_info.setText(preview)
         else:
             self.lbl_config_info.setText("⚠ config.txt 없음 또는 설정 누락")
             self.lbl_config_info.setStyleSheet("color:#C00000; font-weight:bold;")
 
-        self.btn_query.setEnabled(True)
-        self.log(
-            f"로그인 완료: {CURRENT_USER.saname if CURRENT_USER else ''}({CURRENT_USER.sabun if CURRENT_USER else ''}) | "
-            f"DB: {self.db_config['Host']} / {self.db_config['DB_Name']}"
-        )
-        self.load_channels()
-        self.load_consult_types()
+        db_path = os.path.join(DB_DIR, DB_FILE)
+        if not os.path.exists(db_path):
+            self.log("Config_DB.db 없음 → Google Drive 다운로드 중...")
+            ok, result = download_db()
+            if not ok:
+                QMessageBox.critical(self, "설정 로드 실패", f"Config_DB.db 다운로드 불가.\n오류: {result}")
+                return
+
+        try:
+            self.db_config = load_db_config()
+            self.log(f"DB 준비 완료 → {self.db_config['Host']} / {self.db_config['DB_Name']}")
+            self.btn_query.setEnabled(True)
+            self.load_channels()
+        except Exception as e:
+            QMessageBox.critical(self, "DB 설정 오류", str(e))
 
     def load_channels(self):
         if not self.db_config:
@@ -988,101 +817,6 @@ class MainWindow(QMainWindow):
     def _on_channel_error(self, msg: str):
         self.btn_refresh_ch.setEnabled(True)
         QMessageBox.warning(self, "방송사 로드 오류", msg)
-
-    def load_consult_types(self):
-        """상담구분 콤보박스 데이터 로드"""
-        self.btn_refresh_ct.setEnabled(False)
-        self.ct_worker = ConsultTypeWorker(self.db_config)
-        self.ct_worker.finished.connect(self._on_consult_types_loaded)
-        self.ct_worker.error.connect(self._on_consult_type_error)
-        self.ct_worker.start()
-
-    def _on_consult_types_loaded(self, types: list[str]):
-        self.cmb_consult_type.clear()
-        for t in types:
-            self.cmb_consult_type.addItem(t)
-        self.btn_refresh_ct.setEnabled(True)
-        self.log(f"상담구분 {len(types)}개 로드 완료")
-
-    def _on_consult_type_error(self, msg: str):
-        self.btn_refresh_ct.setEnabled(True)
-        self.log(f"상담구분 로드 오류: {msg}")
-        # 로드 실패 시 빈 항목으로 수동 입력 가능하도록 콤보 초기화만
-        self.cmb_consult_type.clear()
-
-    # ── 상담내역 등록 관련 ────────────────────────────────────────────
-
-    def _update_memo_code_count(self):
-        codes = parse_member_codes(self.txt_memo_codes.toPlainText())
-        self.lbl_memo_code_count.setText(f"{len(codes)}개 입력됨")
-
-    def _run_memo_insert(self):
-        codes = parse_member_codes(self.txt_memo_codes.toPlainText())
-        if not codes:
-            QMessageBox.warning(self, "입력 오류", "회원코드를 입력해 주세요.")
-            return
-
-        consult_type = self.cmb_consult_type.currentText().strip()
-        if not consult_type:
-            QMessageBox.warning(self, "입력 오류", "상담구분을 선택해 주세요.")
-            return
-
-        memo_content = self.txt_memo_content.toPlainText().strip()
-        if not memo_content:
-            QMessageBox.warning(self, "입력 오류", "상담내용을 입력해 주세요.")
-            return
-
-        ans = QMessageBox.question(
-            self, "등록 확인",
-            f"회원코드 {len(codes)}건에 상담내역을 등록합니다.\n계속하시겠습니까?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if ans != QMessageBox.StandardButton.Yes:
-            return
-
-        self.btn_memo_submit.setEnabled(False)
-        self.txt_memo_log.appendPlainText(
-            f"{'─' * 50}\n"
-            f"상담구분: {consult_type}\n"
-            f"상담내용: {memo_content[:40]}{'...' if len(memo_content) > 40 else ''}\n"
-        )
-
-        self.memo_worker = MemoInsertWorker(
-            self.db_config, codes, memo_content, consult_type, CURRENT_USER.sabun if CURRENT_USER else ''
-        )
-        self.memo_worker.log_msg.connect(self._on_memo_log)
-        self.memo_worker.finished.connect(self._on_memo_finished)
-        self.memo_worker.error.connect(self._on_memo_error)
-        self.memo_worker.start()
-
-    def _on_memo_log(self, msg: str):
-        self.txt_memo_log.appendPlainText(msg)
-        # 스크롤 항상 최하단 유지
-        self.txt_memo_log.verticalScrollBar().setValue(
-            self.txt_memo_log.verticalScrollBar().maximum()
-        )
-        self.log(msg.strip())
-
-    def _on_memo_finished(self, success: int, fail: int):
-        self.btn_memo_submit.setEnabled(True)
-        result_msg = f"등록 완료 — 성공: {success}건 / 실패: {fail}건"
-        self.log(result_msg)
-        if fail == 0:
-            QMessageBox.information(self, "등록 완료", result_msg)
-        else:
-            QMessageBox.warning(
-                self, "등록 완료 (일부 실패)",
-                f"{result_msg}\n\n실패 항목은 처리 현황 로그를 확인하세요."
-            )
-
-    def _on_memo_error(self, msg: str):
-        self.btn_memo_submit.setEnabled(True)
-        self.txt_memo_log.appendPlainText(f"[치명적 오류] {msg}")
-        self.log(f"상담내역 등록 오류: {msg}")
-        QMessageBox.critical(
-            self, "등록 오류",
-            f"DB 연결 또는 처리 중 오류가 발생했습니다.\n\n{msg}"
-        )
 
     def _update_phone_count(self):
         phones = parse_phones(self.txt_phones.toPlainText())
@@ -1190,52 +924,9 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-
-    # ── 1. Config_DB.db 확인 / Google Drive 다운로드 ──────────────────
-    db_path = os.path.join(DB_DIR, DB_FILE)
-    if not os.path.exists(db_path):
-        # 다운로드 전 간단한 진행 안내
-        QMessageBox.information(
-            None, "초기화",
-            "설정 파일(Config_DB.db)이 없습니다.\n"
-            "Google Drive에서 자동으로 다운로드합니다."
-        )
-        ok, result = download_db()
-        if not ok:
-            QMessageBox.critical(
-                None, "초기화 오류",
-                f"설정 DB 다운로드에 실패했습니다.\n\n오류: {result}"
-            )
-            sys.exit(1)
-
-    # ── 2. DB 접속 정보 로드 ──────────────────────────────────────────
-    try:
-        db_config = load_db_config()
-    except Exception as e:
-        QMessageBox.critical(
-            None, "초기화 오류",
-            f"DB 설정 로드에 실패했습니다.\n\n{e}"
-        )
-        sys.exit(1)
-
-    # ── 3. 로그인 다이얼로그 ──────────────────────────────────────────
-    login_dlg = LoginDialog(
-        db_config,
-        title="방송 DB 처리 시스템 로그인",
-        window_title="방송 DB 처리 시스템 - 로그인",
-    )
-    if login_dlg.exec() != LoginDialog.DialogCode.Accepted or not login_dlg.user:
-        # 3회 실패 또는 창 닫기 → 종료
-        sys.exit(0)
-
-    global CURRENT_USER
-    CURRENT_USER = login_dlg.user
-
-    # ── 4. 메인 윈도우 표시 ───────────────────────────────────────────
-    win = MainWindow(db_config)
+    win = MainWindow()
     win.show()
     sys.exit(app.exec())
-
 
 if __name__ == "__main__":
     main()
